@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# dsh-sync-plugins — 把 profile 里的 @deepseek-ai/dsh-* 插件对齐到当前 dsh 版本
+#
+# 为什么要这一步: dsh 0.2.1-alpha.1 起 CLI 安装包不再包含 hook 桥接，
+#   @deepseek-ai/dsh-hooks-claude-code 这类可选插件装在 profile 里，peer 依赖
+#   又是精确版本；dsh 升级后不同步，启动 preflight 会把整行静默禁用。
+#
+# 用法:
+#   dsh-sync-plugins                 同步默认 profile（web）
+#   dsh-sync-plugins --profile tui   同步别的 profile
+#   dsh-sync-plugins --dry-run       只显示要改什么，不动文件
+#   DSH_HOME=/path dsh-sync-plugins  指定别的 dsh 家目录
+#
+# 同步后重启 dsh web 才生效（本脚本不会去动你正在跑的进程）。
+set -uo pipefail
+
+usage() { sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; }
+
+PROFILE="${DSH_PROFILE:-web}"
+DRY_RUN=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --profile) [ $# -ge 2 ] || { echo "--profile 需要一个名字" >&2; exit 2; }; PROFILE="$2"; shift 2 ;;
+    --profile=*) PROFILE="${1#*=}"; shift ;;
+    --dry-run|-n) DRY_RUN=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "未知参数: $1（-h 看用法）" >&2; exit 2 ;;
+  esac
+done
+
+command -v dsh >/dev/null 2>&1 || { echo "找不到 dsh 命令" >&2; exit 1; }
+RUNTIME="$(dsh --version 2>/dev/null | tr -d '[:space:]')"
+RUNTIME="${RUNTIME#v}"
+[ -n "$RUNTIME" ] || { echo "读不到 dsh --version" >&2; exit 1; }
+
+PROFILE_DIR="${DSH_HOME:-$HOME/.dsh}/profiles/$PROFILE"
+[ -f "$PROFILE_DIR/package.json" ] || { echo "profile 不存在: $PROFILE_DIR" >&2; exit 1; }
+
+mapfile -t NAMES < <(node -e '
+const deps = require(process.argv[1]).dependencies || {}
+for (const name of Object.keys(deps)) {
+  if (name.startsWith("@deepseek-ai/dsh-")) console.log(name)
+}
+' "$PROFILE_DIR/package.json") || { echo "读不了 $PROFILE_DIR/package.json" >&2; exit 1; }
+
+if [ "${#NAMES[@]}" -eq 0 ]; then
+  echo "profile $PROFILE 里没有 @deepseek-ai/dsh-* 插件，无需同步（运行时 $RUNTIME）"
+  exit 0
+fi
+
+STALE=()
+for name in "${NAMES[@]}"; do
+  spec="$(node -p 'require(process.argv[1]).dependencies[process.argv[2]]' "$PROFILE_DIR/package.json" "$name")"
+  [ "$spec" = "$RUNTIME" ] || STALE+=("$name@$RUNTIME")
+done
+
+if [ "${#STALE[@]}" -eq 0 ]; then
+  echo "已同步：profile $PROFILE 的 ${#NAMES[@]} 个 dsh 插件都是 $RUNTIME"
+else
+  echo "运行时 dsh $RUNTIME；需要更新 ${#STALE[@]}/${#NAMES[@]} 个插件:"
+  printf '  %s\n' "${STALE[@]}"
+  if [ "$DRY_RUN" = 1 ]; then
+    echo "(--dry-run：未执行)"
+    exit 0
+  fi
+  if ! dsh plugin --profile "$PROFILE" add "${STALE[@]}"; then
+    echo "安装失败：profile 未更新。确认网络、npm 上是否已发布 $RUNTIME（自编译版没有）" >&2
+    exit 1
+  fi
+fi
+
+# 自检：装上的版本必须等于运行时；peer 里写死的精确版本也必须等于运行时，
+# 否则重启后 preflight 仍会把该插件禁用。
+FAIL=0
+for name in "${NAMES[@]}"; do
+  manifest="$PROFILE_DIR/node_modules/$name/package.json"
+  if [ ! -f "$manifest" ]; then
+    echo "✗ $name 未安装"
+    FAIL=1
+    continue
+  fi
+  version="$(node -p 'require(process.argv[1]).version' "$manifest")"
+  if [ "$version" = "$RUNTIME" ]; then
+    echo "✓ $name $version"
+  else
+    echo "✗ $name $version（应为 $RUNTIME）"
+    FAIL=1
+  fi
+  bad_peers="$(node -e '
+const manifest = require(process.argv[1])
+const runtime = process.argv[2]
+const bad = []
+for (const [name, range] of Object.entries(manifest.peerDependencies || {})) {
+  if (!name.startsWith("@deepseek-ai/dsh")) continue
+  if (/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(range) && range !== runtime) bad.push(name + "@" + range)
+}
+if (bad.length) console.log(bad.join(" "))
+' "$manifest" "$RUNTIME")"
+  if [ -n "$bad_peers" ]; then
+    echo "  ! peer 精确版本对不上: $bad_peers"
+    FAIL=1
+  fi
+done
+
+if [ "$FAIL" -ne 0 ]; then
+  echo "自检未通过，把上面的输出发给大肥鱼" >&2
+  exit 1
+fi
+echo "自检通过。dsh web 在跑的话，Ctrl+C 后重新 dsh web 才会用上新版本。"
